@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """
-fd258_card.py — print-ready FBI FD-258 fingerprint card generator.
+fd258_card.py — print-ready **official** FBI FD-258 fingerprint card generator.
 
-Produces a true-size 8" x 8" (576 x 576 pt) FD-258 fingerprint card as a
-single-page PDF, ready for manual ink fingerprinting and mailing to:
+This tool does not draw an FD-258.  It ships the *official* FD-258 that the FBI
+publishes on fbi.gov, byte-for-byte, and (optionally) lays typed values on top
+of it.  The card is a true-size 8" x 8" (576 x 576 pt) two-page PDF — page 1 is
+the APPLICANT card, page 2 is the FBI/DOJ back with the usage instructions and
+the print-pattern diagrams — ready for manual ink fingerprinting and mailing to:
 
     FBI CJIS Division
     ATTN: ELECTRONIC SUMMARY REQUEST
@@ -13,35 +16,47 @@ single-page PDF, ready for manual ink fingerprinting and mailing to:
 (Always mail the card together with a copy of the FBI EDO order confirmation
 email.)
 
-Design notes
-------------
-* The card is drawn as **vector** art with reportlab's canvas API, so it stays
-  crisp at any output resolution.  A 576x576 pt page rasterises to exactly
-  2400 x 2400 px at 300 DPI (576 / 72 * 300 = 2400), which is the canonical
-  print-ready build.  The rejected "576x576 @ 72 ppi" build is a blurry raster
-  downsample and this tool never produces it.
-* ``--raster`` re-renders that vector page through poppler at 300 DPI and
-  embeds the resulting 2400 x 2400 px image in a 576x576 pt page.  The embedded
-  raster is then *literally* 300 DPI (``pdfimages -list`` reports 300/300),
-  which is what the sample card ships as.
-* ``--letter`` centres the same 8x8 card, at 100% scale, on US Letter
-  (612 x 792 pt) with trim marks, for printing at a library/office printer and
-  trimming down to 8x8.
+Source of truth
+---------------
+* Official PDF: https://www.fbi.gov/file-repository/cjis/fd-258.pdf
+  (served as ``FD-258fillable.pdf``).  A copy is bundled at
+  ``official/fd-258-official-fillable.pdf``; ``generate`` uses that cache and
+  falls back to downloading from fbi.gov when it is missing.
+* The published PDF has been flattened by PDFfiller — only ``ORI`` survives as
+  a live AcroForm text field — so pre-fill is done as a **text overlay** at the
+  official field coordinates (pypdf + reportlab), never via form filling.
+* Blank remains the default: the manual ink workflow wants an empty card.
 
-Dependencies: reportlab only (poppler-utils for ``verify`` and ``--raster``).
+Modes
+-----
+* default   the official card as published, both pages, 576 x 576 pt.
+* --letter  each official page mounted at **100% scale** on US Letter
+            (612 x 792 pt) with trim marks, for printing on standard paper and
+            trimming down to 8" x 8".
+* --raster  each official page re-rendered through poppler at 300 DPI (2400 x
+            2400 px) and embedded 1:1, plus an invisible text layer rebuilt
+            from the original word boxes so the card stays searchable and the
+            QA gate's text checks keep working.
+
+Dependencies: pypdf + reportlab (poppler-utils pdfinfo/pdfimages/pdftotext/
+pdftoppm for ``verify``, ``--raster`` and the invisible text layer).
 """
 
 from __future__ import annotations
 
 import argparse
+import io
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.request
+import xml.etree.ElementTree as ET
 
-from reportlab.lib.colors import Color, black, white
+from pypdf import PdfReader, PdfWriter, Transformation
+from reportlab.lib.colors import Color, black
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfgen import canvas as rl_canvas
 
@@ -51,133 +66,152 @@ from reportlab.pdfgen import canvas as rl_canvas
 
 PT_PER_INCH = 72.0
 
-CARD_SIZE = 576.0                     # 8.00 in  -> HARD REQUIREMENT #1
-LETTER_W, LETTER_H = 612.0, 792.0     # US Letter -> HARD REQUIREMENT #4
+CARD_SIZE = 576.0                     # 8.00 in  -> the official card's page size
+LETTER_W, LETTER_H = 612.0, 792.0     # US Letter mounting
 
-PRINT_DPI = 300                       # HARD REQUIREMENT #2
+PRINT_DPI = 300
 CARD_PX_AT_300 = int(round(CARD_SIZE / PT_PER_INCH * PRINT_DPI))   # == 2400
 
-MARGIN = 18.0                         # 0.25 in quiet zone inside the card
-CONTENT = CARD_SIZE - 2 * MARGIN      # == 540 pt of drawable width/height
+# Where the 8x8 card sits on the Letter sheet: centred, unscaled (100%).
+LETTER_OX = (LETTER_W - CARD_SIZE) / 2.0        # 18 pt
+LETTER_OY = (LETTER_H - CARD_SIZE) / 2.0        # 108 pt
 
-# Vertical stack of the card, top to bottom.  The sum of every band plus the
-# gaps between them must be exactly CONTENT; this is asserted at import time.
-H_HEADER = 54.0        # FBI/DOJ masthead + ORI / OCA / DATE + LEAVE BLANK
-H_INSTR = 11.0         # "TYPE OR PRINT ALL INFORMATION IN BLACK" strip
-H_DATA = 134.0         # personal-data field grid
-H_ROLLED = 118.0       # one row of five rolled impressions (x2)
-H_PLAIN = 90.0         # simultaneous four-finger + thumb impressions
-GAP = 3.0              # gap between bands
+OFFICIAL_PAGES = 2                    # APPLICANT card + FBI/DOJ back
 
-# Line weights.  Deliberately chunky: thin hairlines disappear on cheap laser
-# printers and the boxes have to stay legible under ink.
-LW_FRAME = 1.4         # card outer frame
-LW_BOX = 1.0           # field / impression boxes
-LW_RULE = 0.6          # internal dividers (label strips, etc.)
+# --------------------------------------------------------------------------- #
+# The official card
+# --------------------------------------------------------------------------- #
 
-# Typography
-F_LABEL = "Helvetica"          # field captions
-F_CODE = "Helvetica-Bold"      # NCIC field codes (NAM, DOB, ...)
-F_VALUE = "Helvetica"          # operator-supplied values
+OFFICIAL_URL = "https://www.fbi.gov/file-repository/cjis/fd-258.pdf"
+REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+OFFICIAL_CACHE = os.path.join(REPO_DIR, "official", "fd-258-official-fillable.pdf")
+OFFICIAL_MIN_BYTES = 200_000          # the real file is ~1.0 MB; anything tiny is an error page
+
+# Strings that only the genuine FBI-published FD-258 carries.  The QA gate
+# proves provenance with these.
+MARKER_REVISION = "FD-258 (Rev. 10/31/2023)"
+MARKER_OMB = "OMB No. 1110-0046"
+MARKER_AGENCY = "FEDERAL BUREAU OF INVESTIGATION"
+
+
+def official_card_path(cache: str = OFFICIAL_CACHE,
+                       allow_download: bool = True) -> str:
+    """
+    Return a path to the official FD-258 PDF.
+
+    Uses the bundled ``official/`` cache; downloads it from fbi.gov when the
+    cache is missing (or is too small to be the real document).
+    """
+    if os.path.isfile(cache) and os.path.getsize(cache) >= OFFICIAL_MIN_BYTES:
+        return cache
+    if not allow_download:
+        raise RuntimeError(
+            f"official FD-258 not cached at {cache} and downloading is disabled")
+    return download_official_card(cache)
+
+
+def download_official_card(dest: str = OFFICIAL_CACHE,
+                           url: str = OFFICIAL_URL) -> str:
+    """Fetch the official FD-258 from fbi.gov into `dest` (atomically)."""
+    os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
+    req = urllib.request.Request(url, headers={"User-Agent": "fd258_card.py"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            payload = resp.read()
+    except Exception as exc:                       # network, DNS, TLS, HTTP...
+        raise RuntimeError(
+            f"could not download the official FD-258 from {url}: {exc}. "
+            f"Place the file at {dest} manually and retry.") from exc
+
+    if not payload.startswith(b"%PDF") or len(payload) < OFFICIAL_MIN_BYTES:
+        raise RuntimeError(f"{url} did not return a PDF "
+                           f"({len(payload)} bytes, header {payload[:8]!r})")
+
+    tmp = dest + ".part"
+    with open(tmp, "wb") as fh:
+        fh.write(payload)
+    os.replace(tmp, dest)
+    return dest
+
+
+# --------------------------------------------------------------------------- #
+# Pre-fill overlay geometry
+# --------------------------------------------------------------------------- #
+# Coordinates were measured off the official page 1 with ``pdftotext -bbox``,
+# so they are expressed the way that tool reports them: **origin top-left, y
+# growing downwards**, in points on the 576 x 576 page.  ``_field_xy`` flips
+# them into reportlab's bottom-left space.
+#
+# Each entry is (x, y_from_top_of_baseline, max_width, font_size).  Signature
+# boxes are deliberately absent: they have to be signed by hand, in ink, in the
+# presence of the official taking the prints.
+
+OVERLAY_FIELDS: dict[str, tuple[float, float, float, float]] = {
+    # name row
+    "lastname":            (227.0,  40.0,  84.0, 8.0),
+    "firstname":           (316.0,  40.0,  75.0, 8.0),
+    "middlename":          (396.0,  40.0,  47.0, 8.0),
+    # aliases / ORI row
+    "aliases":             (219.0,  62.0,  92.0, 7.5),
+    "ori":                 (330.0,  62.0, 108.0, 8.0),
+    # residence block
+    "residence":           (  8.0,  90.0, 200.0, 8.0),
+    # descriptors row
+    "citizenship":         (222.0, 107.0,  88.0, 7.5),
+    "sex":                 (330.0, 107.0,  14.0, 7.5),
+    "race":                (348.0, 107.0,  22.0, 7.5),
+    "height":              (375.0, 107.0,  25.0, 7.5),
+    "weight":              (405.0, 107.0,  25.0, 7.5),
+    "eyes":                (435.0, 107.0,  23.0, 7.5),
+    "hair":                (463.0, 107.0,  21.0, 7.5),
+    "pob":                 (490.0, 107.0,  82.0, 7.5),
+    # date of birth (Month / Day / Year)
+    "dob":                 (490.0,  89.0,  82.0, 8.0),
+    # date fingerprinted (the DATE box beside the official's signature)
+    "date_fingerprinted":  (  7.0, 122.0,  30.0, 7.0),
+    # right-hand admin column
+    "oca":                 (222.0, 127.0,  95.0, 8.0),
+    "ssn":                 (222.0, 186.0,  95.0, 8.0),
+    # left-hand free-text blocks
+    "employer":            (  8.0, 145.0, 200.0, 8.0),
+    "reason":              (  8.0, 186.0, 200.0, 8.0),
+}
+
+# CLI keys that are written into another field's box on the official card.
+# (The pre-official tool called the employer block "contributor", and the
+# official card has one DATE box rather than separate signed/fingerprinted
+# dates -- keep both spellings working for existing callers.)
+FIELD_ALIASES = {
+    "contributor": "employer",
+    "date_signed": "date_fingerprinted",
+}
+
+# Every data key the CLI accepts.
+DATA_KEYS = list(OVERLAY_FIELDS) + list(FIELD_ALIASES)
+
+F_VALUE = "Helvetica"
 F_HEAD = "Helvetica-Bold"
-SZ_LABEL = 5.0
-SZ_CODE = 5.0
-SZ_VALUE = 9.0
-
-CAP_PAD = 2.0          # inset of a caption from its box corner
+F_LABEL = "Helvetica"
 GREY = Color(0.45, 0.45, 0.45)
-
-# --------------------------------------------------------------------------- #
-# Field grid definition
-# --------------------------------------------------------------------------- #
-# Each data row is (height, [(caption, ncic_code, data_key, width), ...]).
-# Widths in a row must sum to CONTENT (asserted below).
-
-DATA_ROWS = [
-    (22.0, [
-        ("LAST NAME", "NAM", "lastname", 200.0),
-        ("FIRST NAME", None, "firstname", 170.0),
-        ("MIDDLE NAME", None, "middlename", 170.0),
-    ]),
-    (22.0, [
-        ("SIGNATURE OF PERSON FINGERPRINTED", None, None, 330.0),
-        ("ALIASES", "AKA", "aliases", 210.0),
-    ]),
-    (22.0, [
-        ("RESIDENCE OF PERSON FINGERPRINTED", "RES", "residence", 380.0),
-        ("COUNTRY OF CITIZENSHIP", "CTZ", "citizenship", 160.0),
-    ]),
-    (20.0, [
-        ("DATE OF BIRTH  (MM DD YYYY)", "DOB", "dob", 96.0),
-        ("SEX", None, "sex", 44.0),
-        ("RACE", None, "race", 50.0),
-        ("HGT", None, "height", 46.0),
-        ("WGT", None, "weight", 46.0),
-        ("EYES", None, "eyes", 50.0),
-        ("HAIR", None, "hair", 50.0),
-        ("PLACE OF BIRTH", "POB", "pob", 158.0),
-    ]),
-    (22.0, [
-        ("SIGNATURE OF OFFICIAL TAKING FINGERPRINTS", None, None, 300.0),
-        ("DATE SIGNED", None, "date_signed", 110.0),
-        ("SOCIAL SECURITY NO.", "SOC", "ssn", 130.0),
-    ]),
-    (26.0, [
-        ("CONTRIBUTOR'S NAME AND ADDRESS", None, "contributor", 300.0),
-        ("REASON FINGERPRINTED", None, "reason", 240.0),
-    ]),
-]
-
-# Rolled impressions: 5 across, 2 rows.  Numbering follows the FD-258.
-ROLLED_RIGHT = ["1. R. THUMB", "2. R. INDEX", "3. R. MIDDLE",
-                "4. R. RING", "5. R. LITTLE"]
-ROLLED_LEFT = ["6. L. THUMB", "7. L. INDEX", "8. L. MIDDLE",
-               "9. L. RING", "10. L. LITTLE"]
-
-# Bottom band: plain (simultaneous) impressions.
-PLAIN_BLOCKS = [
-    ("LEFT FOUR FINGERS TAKEN SIMULTANEOUSLY", 170.0),
-    ("L. THUMB", 100.0),
-    ("R. THUMB", 100.0),
-    ("RIGHT FOUR FINGERS TAKEN SIMULTANEOUSLY", 170.0),
-]
-
-MASTHEAD = [
-    ("FEDERAL BUREAU OF INVESTIGATION", F_HEAD, 9.0),
-    ("UNITED STATES DEPARTMENT OF JUSTICE", F_LABEL, 7.0),
-    ("WASHINGTON, D.C. 20537", F_LABEL, 6.0),
-    ("FINGERPRINT CARD", F_HEAD, 8.5),
-]
-
-INSTRUCTION = ("TYPE OR PRINT ALL INFORMATION IN BLACK  •  "
-               "SIGNATURE OF PERSON FINGERPRINTED MUST BE MADE IN THE "
-               "PRESENCE OF THE OFFICIAL TAKING THE FINGERPRINTS")
 
 CJIS_ADDRESS = ("FBI CJIS Division, ATTN: ELECTRONIC SUMMARY REQUEST, "
                 "1000 Custer Hollow Road, Clarksburg, WV 26306")
 
-# Every data key the CLI can pre-fill.
-DATA_KEYS = [
-    "lastname", "firstname", "middlename", "aliases", "residence",
-    "citizenship", "dob", "sex", "race", "height", "weight", "eyes", "hair",
-    "pob", "date_signed", "ssn", "contributor", "reason", "ori", "oca",
-    "date_fingerprinted",
-]
+
+def resolve_data(data: dict | None) -> dict:
+    """Fold alias keys onto the official card's field names."""
+    resolved: dict[str, str] = {}
+    for key, value in (data or {}).items():
+        if not value:
+            continue
+        resolved.setdefault(FIELD_ALIASES.get(key, key), str(value))
+    return {k: v for k, v in resolved.items() if k in OVERLAY_FIELDS}
 
 
-def _validate_geometry() -> None:
-    """Fail loudly at import time if the layout no longer adds up to 8x8."""
-    bands = [H_HEADER, H_INSTR, H_DATA, H_ROLLED, H_ROLLED, H_PLAIN]
-    total = sum(bands) + GAP * (len(bands) - 1)
-    assert abs(total - CONTENT) < 1e-6, f"card bands sum to {total}, want {CONTENT}"
-    assert abs(sum(h for h, _ in DATA_ROWS) - H_DATA) < 1e-6, "data rows misfit"
-    for _, cells in DATA_ROWS:
-        w = sum(c[3] for c in cells)
-        assert abs(w - CONTENT) < 1e-6, f"data row width {w}, want {CONTENT}"
-    assert abs(sum(w for _, w in PLAIN_BLOCKS) - CONTENT) < 1e-6, "plain row misfit"
-
-
-_validate_geometry()
+def _field_xy(x: float, y_from_top: float,
+              ox: float = 0.0, oy: float = 0.0) -> tuple[float, float]:
+    """Top-left-origin card coordinates -> reportlab page coordinates."""
+    return ox + x, oy + CARD_SIZE - y_from_top
 
 
 # --------------------------------------------------------------------------- #
@@ -193,200 +227,29 @@ def fit_size(text: str, font: str, size: float, max_w: float,
 
 
 def draw_fitted(c: rl_canvas.Canvas, x: float, y: float, text: str, font: str,
-                size: float, max_w: float, align: str = "left") -> None:
+                size: float, max_w: float, align: str = "left",
+                mode: int = 0) -> None:
     """Draw `text` at baseline `y`, auto-shrinking so it never overflows."""
     if not text:
         return
     size = fit_size(text, font, size, max_w)
     c.setFont(font, size)
     if align == "center":
-        c.drawCentredString(x, y, text)
+        c.drawCentredString(x, y, text, mode=mode)
     elif align == "right":
-        c.drawRightString(x, y, text)
+        c.drawRightString(x, y, text, mode=mode)
     else:
-        c.drawString(x, y, text)
+        c.drawString(x, y, text, mode=mode)
 
 
-def box(c: rl_canvas.Canvas, x: float, top: float, w: float, h: float,
-        lw: float = LW_BOX) -> None:
-    """Stroke a rectangle given its *top* edge (top-down layout convenience)."""
-    c.setLineWidth(lw)
-    c.setStrokeColor(black)
-    c.rect(x, top - h, w, h, stroke=1, fill=0)
-
-
-def field(c: rl_canvas.Canvas, x: float, top: float, w: float, h: float,
-          caption: str, code: str | None = None, value: str | None = None,
-          value_size: float = SZ_VALUE) -> None:
-    """
-    Draw one form field: a box, a small caption in the top-left corner, an
-    optional NCIC code in the top-right corner, and an optional filled value
-    sitting on the writing line near the bottom of the box.
-    """
-    box(c, x, top, w, h)
-
+def draw_prefill(c: rl_canvas.Canvas, data: dict,
+                 ox: float = 0.0, oy: float = 0.0) -> None:
+    """Lay the typed values over the official card placed at (ox, oy)."""
     c.setFillColor(black)
-    cap_w = w - 2 * CAP_PAD - (14.0 if code else 0.0)
-    draw_fitted(c, x + CAP_PAD, top - CAP_PAD - SZ_LABEL, caption,
-                F_LABEL, SZ_LABEL, cap_w)
-    if code:
-        c.setFillColor(GREY)
-        draw_fitted(c, x + w - CAP_PAD, top - CAP_PAD - SZ_CODE, code,
-                    F_CODE, SZ_CODE, 14.0, align="right")
-        c.setFillColor(black)
-
-    if value:
-        draw_fitted(c, x + CAP_PAD + 1.0, top - h + 4.0, str(value),
-                    F_VALUE, value_size, w - 2 * CAP_PAD - 2.0)
-
-
-def impression_block(c: rl_canvas.Canvas, x: float, top: float, w: float,
-                     h: float, label: str) -> None:
-    """
-    One fingerprint impression box: a heavier border, a thin label strip across
-    the top, and a large clean white area for the inked impression.
-    """
-    box(c, x, top, w, h, lw=LW_BOX)
-    strip_h = 11.0
-    c.setLineWidth(LW_RULE)
-    c.setStrokeColor(black)
-    c.line(x, top - strip_h, x + w, top - strip_h)
-    c.setFillColor(black)
-    draw_fitted(c, x + w / 2.0, top - strip_h + 3.4, label,
-                F_CODE, 6.0, w - 4.0, align="center")
-
-
-def band_label(c: rl_canvas.Canvas, x: float, top: float, w: float, h: float,
-               left: str, right: str) -> None:
-    """Row caption strip drawn above a row of impression blocks."""
-    c.setFillColor(black)
-    draw_fitted(c, x + 2.0, top - h + 2.0, left, F_HEAD, 7.0, w * 0.45)
-    c.setFillColor(GREY)
-    draw_fitted(c, x + w - 2.0, top - h + 2.0, right, F_LABEL, 5.5,
-                w * 0.5, align="right")
-    c.setFillColor(black)
-
-
-# --------------------------------------------------------------------------- #
-# Card drawing
-# --------------------------------------------------------------------------- #
-
-def draw_card(c: rl_canvas.Canvas, ox: float, oy: float,
-              data: dict | None = None) -> None:
-    """
-    Draw a complete FD-258 card whose lower-left corner is at (ox, oy).
-
-    Everything is vector: lines and text only, no rasters, so the result is
-    resolution independent and rasterises cleanly at 300 DPI or higher.
-    """
-    data = data or {}
-    left = ox + MARGIN
-    right = left + CONTENT
-    top = oy + CARD_SIZE - MARGIN     # top edge of the content area
-
-    c.setFillColor(black)
-    c.setStrokeColor(black)
-
-    # ---- card frame -------------------------------------------------------
-    c.setLineWidth(LW_FRAME)
-    c.rect(left, oy + MARGIN, CONTENT, CONTENT, stroke=1, fill=0)
-
-    y = top
-
-    # ---- header band ------------------------------------------------------
-    _draw_header(c, left, y, data)
-    y -= H_HEADER + GAP
-
-    # ---- instruction strip ------------------------------------------------
-    box(c, left, y, CONTENT, H_INSTR, lw=LW_RULE)
-    draw_fitted(c, left + CONTENT / 2.0, y - H_INSTR + 3.6, INSTRUCTION,
-                F_LABEL, 5.6, CONTENT - 8.0, align="center")
-    y -= H_INSTR + GAP
-
-    # ---- personal data grid ----------------------------------------------
-    for row_h, cells in DATA_ROWS:
-        x = left
-        for caption, code, key, w in cells:
-            field(c, x, y, w, row_h, caption, code,
-                  data.get(key) if key else None)
-            x += w
-        y -= row_h
-    y -= GAP
-
-    # ---- rolled impressions: right hand, then left hand -------------------
-    for labels, hand in ((ROLLED_RIGHT, "RIGHT HAND"), (ROLLED_LEFT, "LEFT HAND")):
-        band_h = 10.0
-        band_label(c, left, y, CONTENT, band_h, hand,
-                   "ROLLED IMPRESSIONS — ROLL EACH FINGER NAIL TO NAIL")
-        y -= band_h
-        blk_h = H_ROLLED - band_h
-        blk_w = CONTENT / 5.0
-        for i, label in enumerate(labels):
-            impression_block(c, left + i * blk_w, y, blk_w, blk_h, label)
-        y -= blk_h + GAP
-
-    # ---- plain (simultaneous) impressions --------------------------------
-    band_h = 10.0
-    band_label(c, left, y, CONTENT, band_h,
-               "PLAIN IMPRESSIONS — TAKEN SIMULTANEOUSLY",
-               "PRESS FINGERS FLAT — DO NOT ROLL")
-    y -= band_h
-    blk_h = H_PLAIN - band_h
-    x = left
-    for label, w in PLAIN_BLOCKS:
-        impression_block(c, x, y, w, blk_h, label)
-        x += w
-    y -= blk_h
-
-    # Bottom of the stack must land exactly on the card's bottom margin.
-    assert abs(y - (oy + MARGIN)) < 1e-6, f"layout drift: {y - (oy + MARGIN)}"
-
-    # Fine print, tucked inside the bottom impression band's baseline area.
-    c.setFillColor(GREY)
-    draw_fitted(c, right, oy + MARGIN - 7.0, "FD-258 (8\" × 8\")",
-                F_LABEL, 4.5, 120.0, align="right")
-    c.setFillColor(black)
-
-
-def _draw_header(c: rl_canvas.Canvas, left: float, top: float,
-                 data: dict) -> None:
-    """
-    Header band: administrative boxes on the left (ORI / OCA / DATE), the
-    FBI masthead in the middle, and the FBI-use "LEAVE BLANK" box at right.
-    """
-    col_l_w = 190.0
-    col_r_w = 168.0
-    col_c_x = left + col_l_w
-    col_c_w = CONTENT - col_l_w - col_r_w
-
-    # Left: three stacked administrative fields.
-    admin = [
-        ("ORIGINATING AGENCY IDENTIFIER", "ORI", "ori"),
-        ("YOUR NO.", "OCA", "oca"),
-        ("DATE FINGERPRINTED  (MM DD YYYY)", None, "date_fingerprinted"),
-    ]
-    row_h = H_HEADER / len(admin)
-    y = top
-    for caption, code, key in admin:
-        field(c, left, y, col_l_w, row_h, caption, code, data.get(key),
-              value_size=8.0)
-        y -= row_h
-
-    # Centre: masthead.  Lines are vertically distributed inside the band.
-    line_gap = (H_HEADER - sum(s for _, _, s in MASTHEAD)) / (len(MASTHEAD) + 1)
-    ty = top - line_gap
-    cx = col_c_x + col_c_w / 2.0
-    for text, font, size in MASTHEAD:
-        ty -= size
-        draw_fitted(c, cx, ty, text, font, size, col_c_w - 6.0, align="center")
-        ty -= line_gap
-
-    # Right: FBI-use block.
-    box(c, left + CONTENT - col_r_w, top, col_r_w, H_HEADER)
-    c.setFillColor(GREY)
-    draw_fitted(c, left + CONTENT - col_r_w / 2.0, top - H_HEADER / 2.0 - 3.0,
-                "LEAVE BLANK", F_CODE, 8.0, col_r_w - 8.0, align="center")
-    c.setFillColor(black)
+    for key, value in resolve_data(data).items():
+        fx, fy, max_w, size = OVERLAY_FIELDS[key]
+        x, y = _field_xy(fx, fy, ox, oy)
+        draw_fitted(c, x, y, value, F_VALUE, size, max_w)
 
 
 # --------------------------------------------------------------------------- #
@@ -404,13 +267,15 @@ def _trim_marks(c: rl_canvas.Canvas, ox: float, oy: float) -> None:
             c.line(cx, cy + sy * off, cx, cy + sy * (off + ln))
 
 
-def _letter_notes(c: rl_canvas.Canvas, ox: float, oy: float) -> None:
+def _letter_notes(c: rl_canvas.Canvas, ox: float, oy: float,
+                  page_index: int) -> None:
     """Printing instructions above the card, mailing note below it."""
     cx = LETTER_W / 2.0
+    side = "FRONT (APPLICANT CARD)" if page_index == 0 else "BACK (INSTRUCTIONS)"
     c.setFillColor(black)
     draw_fitted(c, cx, oy + CARD_SIZE + 62.0,
-                "FBI FD-258 FINGERPRINT CARD — PRINT AT 100% (\"ACTUAL "
-                "SIZE\"), THEN TRIM ON THE MARKS TO 8\" × 8\"",
+                f"OFFICIAL FBI FD-258 — {side} — PRINT AT 100% "
+                "(\"ACTUAL SIZE\"), THEN TRIM ON THE MARKS TO 8\" × 8\"",
                 F_HEAD, 8.5, LETTER_W - 72.0, align="center")
     c.setFillColor(GREY)
     draw_fitted(c, cx, oy + CARD_SIZE + 50.0,
@@ -429,99 +294,144 @@ def _letter_notes(c: rl_canvas.Canvas, ox: float, oy: float) -> None:
 # PDF builders
 # --------------------------------------------------------------------------- #
 
-def _new_canvas(path: str, w: float, h: float, title: str) -> rl_canvas.Canvas:
-    c = rl_canvas.Canvas(path, pagesize=(w, h))
-    c.setTitle(title)
-    c.setAuthor("fd258_card.py")
-    c.setSubject("FBI FD-258 fingerprint card, 8x8 in, print at 100%%")
-    c.setCreator("fd258_card.py (reportlab)")
-    return c
+def _set_metadata(writer: PdfWriter, title: str) -> None:
+    writer.add_metadata({
+        "/Title": title,
+        "/Author": "fd258_card.py",
+        "/Subject": "Official FBI FD-258 fingerprint card, 8x8 in, print at 100%",
+        "/Creator": "fd258_card.py (official card from fbi.gov)",
+    })
 
 
-def build_vector_pdf(path: str, data: dict | None = None,
-                     letter: bool = False) -> str:
-    """Write the vector card (8x8) or the letter-mounted card to `path`."""
-    title = "FD-258 Fingerprint Card" + (" (US Letter)" if letter else "")
-    if letter:
-        c = _new_canvas(path, LETTER_W, LETTER_H, title)
-        ox = (LETTER_W - CARD_SIZE) / 2.0          # 18 pt
-        oy = (LETTER_H - CARD_SIZE) / 2.0          # 108 pt  -> 100% scale
-        _trim_marks(c, ox, oy)
-        _letter_notes(c, ox, oy)
-        draw_card(c, ox, oy, data)
-    else:
-        c = _new_canvas(path, CARD_SIZE, CARD_SIZE, title)
-        draw_card(c, 0.0, 0.0, data)
-    c.showPage()
+def _furniture_pdf(data: dict | None, letter: bool, pages: int) -> PdfReader:
+    """
+    Build the in-memory overlay that goes *on top of* the official pages:
+    typed pre-fill values on page 1, plus trim marks and printing notes in
+    --letter mode.  Returns a reader with exactly `pages` pages.
+    """
+    buf = io.BytesIO()
+    page_w, page_h = (LETTER_W, LETTER_H) if letter else (CARD_SIZE, CARD_SIZE)
+    ox, oy = (LETTER_OX, LETTER_OY) if letter else (0.0, 0.0)
+    c = rl_canvas.Canvas(buf, pagesize=(page_w, page_h))
+    for i in range(pages):
+        if letter:
+            _trim_marks(c, ox, oy)
+            _letter_notes(c, ox, oy, i)
+        if i == 0 and data:
+            draw_prefill(c, data, ox, oy)
+        c.showPage()
     c.save()
+    buf.seek(0)
+    return PdfReader(buf)
+
+
+def build_official_pdf(path: str, data: dict | None = None,
+                       letter: bool = False, source: str | None = None) -> str:
+    """
+    Write the official FD-258 to `path`.
+
+    With no `data` and no `letter`, the official pages are passed through
+    unchanged — the output *is* the FBI's card.  `data` adds a text overlay on
+    page 1; `letter` mounts each page at 100% on US Letter with trim marks.
+    """
+    src = source or official_card_path()
+    data = resolve_data(data)
+
+    if letter:
+        # Fresh Letter sheets with the official page dropped on unscaled.
+        writer = PdfWriter()
+        for page in PdfReader(src).pages:
+            sheet = writer.add_blank_page(width=LETTER_W, height=LETTER_H)
+            sheet.merge_transformed_page(
+                page, Transformation().translate(LETTER_OX, LETTER_OY))
+    else:
+        # Pass the official pages through untouched.
+        writer = PdfWriter(clone_from=src)
+
+    if data or letter:
+        furniture = _furniture_pdf(data, letter, len(writer.pages))
+        for page, extra in zip(writer.pages, furniture.pages):
+            page.merge_page(extra)
+
+    _set_metadata(writer, "Official FBI FD-258 Fingerprint Card"
+                          + (" (US Letter)" if letter else ""))
+    with open(path, "wb") as fh:
+        writer.write(fh)
     return path
 
 
-class _InvisibleTextCanvas:
+def _word_boxes(pdf: str, page: int) -> list[tuple[float, float, float, float, str]]:
     """
-    Canvas proxy that draws *only* text, and draws it invisibly (PDF text
-    render mode 3).  Used to lay an extractable text layer over the raster
-    build so the card stays searchable/accessible and so the QA gate's field
-    check works on raster PDFs exactly as it does on vector ones.
+    Word boxes of `page` (1-based) as (xMin, yMin, xMax, yMax, text), in points
+    with a top-left origin, straight from ``pdftotext -bbox``.
     """
-
-    def __init__(self, canvas: rl_canvas.Canvas):
-        self._c = canvas
-
-    def __getattr__(self, name):                    # forward everything else
-        return getattr(self._c, name)
-
-    # geometry is already in the bitmap - drop it
-    def rect(self, *a, **k): pass
-    def line(self, *a, **k): pass
-    def setLineWidth(self, *a, **k): pass
-    def setStrokeColor(self, *a, **k): pass
-
-    def drawString(self, x, y, text, **k):
-        self._c.drawString(x, y, text, mode=3, **k)
-
-    def drawCentredString(self, x, y, text, **k):
-        self._c.drawCentredString(x, y, text, mode=3, **k)
-
-    def drawRightString(self, x, y, text, **k):
-        self._c.drawRightString(x, y, text, mode=3, **k)
+    require_tool("pdftotext")
+    xml = run(["pdftotext", "-bbox", "-f", str(page), "-l", str(page), pdf, "-"])
+    root = ET.fromstring(xml)
+    boxes = []
+    for word in root.iter():
+        if not word.tag.endswith("word") or not (word.text or "").strip():
+            continue
+        a = word.attrib
+        boxes.append((float(a["xMin"]), float(a["yMin"]),
+                      float(a["xMax"]), float(a["yMax"]), word.text.strip()))
+    return boxes
 
 
-def build_raster_pdf(path: str, data: dict | None = None,
-                     letter: bool = False, dpi: int = PRINT_DPI) -> str:
+def _draw_text_layer(c: rl_canvas.Canvas, pdf: str, page: int,
+                     ox: float, oy: float) -> None:
     """
-    Render the vector card through poppler at `dpi` and embed the resulting
-    bitmap at 1:1 page scale, so the PDF carries a *literal* `dpi` raster
-    (``pdfimages -list`` reports it).  `dpi` below 300 is refused: a 72-DPI
-    downsample is the exact regression the QA gate exists to catch.
+    Redraw a page's words invisibly (PDF text render mode 3) at their original
+    positions, so a rasterised build stays searchable and the QA gate's text
+    checks behave exactly as they do on the vector card.
+    """
+    c.setFillColor(black)
+    for x0, y0, x1, y1, text in _word_boxes(pdf, page):
+        size = max(y1 - y0, 1.0)
+        x, y = _field_xy(x0, y1, ox, oy)
+        draw_fitted(c, x, y, text, F_VALUE, size, max(x1 - x0, 1.0), mode=3)
+
+
+def build_raster_pdf(path: str, data: dict | None = None, letter: bool = False,
+                     dpi: int = PRINT_DPI, source: str | None = None) -> str:
+    """
+    Render the official card through poppler at `dpi` and embed the bitmaps at
+    1:1 page scale, so the PDF carries a *literal* `dpi` raster (``pdfimages
+    -list`` reports it).  `dpi` below 300 is refused: a 72-DPI downsample is the
+    exact regression the QA gate exists to catch.
     """
     if dpi < PRINT_DPI:
         raise ValueError(f"--dpi must be >= {PRINT_DPI} (got {dpi}); "
                          "anything lower fails the QA gate")
     require_tool("pdftoppm")
+    src = source or official_card_path()
     page_w, page_h = (LETTER_W, LETTER_H) if letter else (CARD_SIZE, CARD_SIZE)
+    ox, oy = (LETTER_OX, LETTER_OY) if letter else (0.0, 0.0)
+    data = resolve_data(data)
 
     with tempfile.TemporaryDirectory() as tmp:
-        vec = os.path.join(tmp, "vector.pdf")
-        build_vector_pdf(vec, data, letter=letter)
         stem = os.path.join(tmp, "page")
         run(["pdftoppm", "-r", str(dpi), "-png", "-gray", "-aa", "yes",
-             "-aaVector", "yes", "-f", "1", "-l", "1", vec, stem])
+             "-aaVector", "yes", src, stem])
         pngs = sorted(f for f in os.listdir(tmp) if f.endswith(".png"))
         if not pngs:
             raise RuntimeError("pdftoppm produced no output")
-        png = os.path.join(tmp, pngs[0])
 
-        c = _new_canvas(path, page_w, page_h,
-                        f"FD-258 Fingerprint Card ({dpi} DPI)")
-        # Draw the bitmap across the whole page: N px over (page/72) in
-        # => exactly `dpi` DPI in the output PDF.
-        c.drawImage(png, 0, 0, width=page_w, height=page_h)
-        # Invisible text layer, positioned identically to the vector build.
-        ox = (page_w - CARD_SIZE) / 2.0
-        oy = (page_h - CARD_SIZE) / 2.0
-        draw_card(_InvisibleTextCanvas(c), ox, oy, data)
-        c.showPage()
+        c = rl_canvas.Canvas(path, pagesize=(page_w, page_h))
+        c.setTitle(f"Official FBI FD-258 Fingerprint Card ({dpi} DPI)")
+        c.setAuthor("fd258_card.py")
+        c.setCreator("fd258_card.py (official card from fbi.gov)")
+        for i, png in enumerate(pngs):
+            # N px across (CARD_SIZE / 72) in  =>  exactly `dpi` DPI.
+            c.drawImage(os.path.join(tmp, png), ox, oy,
+                        width=CARD_SIZE, height=CARD_SIZE)
+            _draw_text_layer(c, src, i + 1, ox, oy)
+            if letter:
+                _trim_marks(c, ox, oy)
+                _letter_notes(c, ox, oy, i)
+            if i == 0 and data:
+                draw_prefill(c, data, ox, oy)
+            c.showPage()
         c.save()
     return path
 
@@ -612,23 +522,31 @@ def ppm_size(path: str) -> tuple[int, int]:
     return tokens[0], tokens[1]
 
 
+# Labels printed on the official FD-258 (page 1 front, page 2 back).
 REQUIRED_TEXT = [
-    "FEDERAL BUREAU OF INVESTIGATION",
-    "UNITED STATES DEPARTMENT OF JUSTICE",
-    "FINGERPRINT CARD",
-    "ORI", "OCA",
-    "LAST NAME", "FIRST NAME", "MIDDLE NAME", "ALIASES", "RESIDENCE",
-    "DATE OF BIRTH", "SEX", "RACE", "HGT", "WGT", "EYES", "HAIR",
-    "PLACE OF BIRTH",
+    "APPLICANT",
+    "TYPE OR PRINT ALL INFORMATION IN BLACK",
+    "LEAVE BLANK",
+    "LAST NAME", "NAM", "FIRST NAME", "MIDDLE NAME",
     "SIGNATURE OF PERSON FINGERPRINTED",
-    "CONTRIBUTOR'S NAME AND ADDRESS",
-    "REASON FINGERPRINTED",
+    "ALIASES", "AKA",
+    "RESIDENCE OF PERSON FINGERPRINTED",
+    "CITIZENSHIP", "CTZ",
+    "SEX", "RACE", "HGT.", "WGT.", "EYES", "HAIR",
+    "DATE OF BIRTH", "DOB", "PLACE OF BIRTH", "POB",
     "SIGNATURE OF OFFICIAL TAKING FINGERPRINTS",
-    "RIGHT HAND", "LEFT HAND",
+    "YOUR NO.", "OCA",
+    "UNIVERSAL CONTROL NO.", "UCN",
+    "ARMED FORCES NO.", "MNU",
+    "SOCIAL SECURITY NO.", "SOC",
+    "MISCELLANEOUS NO.",
+    "EMPLOYER AND ADDRESS",
+    "REASON FINGERPRINTED",
     "R. THUMB", "R. INDEX", "R. MIDDLE", "R. RING", "R. LITTLE",
     "L. THUMB", "L. INDEX", "L. MIDDLE", "L. RING", "L. LITTLE",
     "LEFT FOUR FINGERS TAKEN SIMULTANEOUSLY",
     "RIGHT FOUR FINGERS TAKEN SIMULTANEOUSLY",
+    "UNITED STATES DEPARTMENT OF JUSTICE",
 ]
 
 
@@ -637,21 +555,29 @@ def pdf_text(path: str) -> str:
     return run(["pdftotext", "-layout", path, "-"])
 
 
+def _norm(text: str) -> str:
+    return " ".join(text.split()).upper()
+
+
 def verify_pdf(path: str, letter: bool = False,
                check_fields: bool = True) -> tuple[bool, list[tuple[str, bool, str]]]:
     """
     Run the QA gate.  Returns (all_passed, [(check_name, passed, detail), ...]).
 
     Gate 1  page size is exactly 576x576 pt (or 612x792 pt in --letter mode)
-    Gate 2  300 DPI print readiness:
+    Gate 2  both official pages are present (front + back)
+    Gate 3  300 DPI print readiness:
               * if the PDF embeds rasters, every one must be >= 300 DPI
                 (this is what rejects the blurry 72-ppi build), and
               * the page must rasterise to the expected 300-DPI pixel size
-    Gate 3  the required FD-258 field labels are present (optional)
+    Gate 4  the official-card provenance markers are present -- this is what
+            proves the output came from the FBI's own FD-258 and is not a
+            hand-drawn approximation
+    Gate 5  the official FD-258 field labels are present (optional)
     """
     results: list[tuple[str, bool, str]] = []
     exp_w, exp_h = (LETTER_W, LETTER_H) if letter else (CARD_SIZE, CARD_SIZE)
-    label = "letter 612x792" if letter else "card 576x576"
+    label = "letter 612x792" if letter else "official card 576x576"
 
     if not os.path.isfile(path):
         return False, [("file exists", False, f"{path} not found")]
@@ -661,9 +587,12 @@ def verify_pdf(path: str, letter: bool = False,
     ok = abs(w - exp_w) < 0.5 and abs(h - exp_h) < 0.5
     results.append((f"page size == {int(exp_w)} x {int(exp_h)} pts ({label})",
                     ok, f"pdfinfo reports {w:g} x {h:g} pts, {pages} page(s)"))
-    results.append(("single page", pages == 1, f"{pages} page(s)"))
 
-    # --- Gate 2a: embedded raster resolution ------------------------------
+    # --- Gate 2: both official pages --------------------------------------
+    results.append((f"{OFFICIAL_PAGES} pages (official front + back)",
+                    pages == OFFICIAL_PAGES, f"{pages} page(s)"))
+
+    # --- Gate 3a: embedded raster resolution ------------------------------
     images = embedded_image_dpi(path)
     if images:
         worst = min(min(x, y) for _, _, x, y in images)
@@ -673,10 +602,10 @@ def verify_pdf(path: str, letter: bool = False,
                         worst >= PRINT_DPI, detail))
     else:
         results.append((f"embedded raster DPI >= {PRINT_DPI}", True,
-                        "no embedded rasters - pure vector art "
-                        "(resolution independent)"))
+                        "no embedded rasters - the official card is vector "
+                        "text/line art (resolution independent)"))
 
-    # --- Gate 2b: 300-DPI rasterisation ----------------------------------
+    # --- Gate 3b: 300-DPI rasterisation -----------------------------------
     px_w, px_h = raster_dimensions(path, PRINT_DPI)
     want_w = int(round(exp_w / PT_PER_INCH * PRINT_DPI))
     want_h = int(round(exp_h / PT_PER_INCH * PRINT_DPI))
@@ -684,12 +613,22 @@ def verify_pdf(path: str, letter: bool = False,
     results.append((f"rasterises to {want_w} x {want_h} px @ {PRINT_DPI} DPI",
                     ok, f"pdftoppm -r {PRINT_DPI} gives {px_w} x {px_h} px"))
 
-    # --- Gate 3: required fields -----------------------------------------
+    text = _norm(pdf_text(path))
+
+    # --- Gate 4: official-card provenance ---------------------------------
+    revision = [m for m in (MARKER_REVISION, MARKER_OMB) if _norm(m) in text]
+    agency = _norm(MARKER_AGENCY) in text
+    found = revision + ([MARKER_AGENCY] if agency else [])
+    results.append(("official FBI card markers present",
+                    bool(revision) and agency,
+                    "found: " + "; ".join(found) if found else
+                    f"none of {MARKER_REVISION!r} / {MARKER_OMB!r} / "
+                    f"{MARKER_AGENCY!r} found - this is not the official card"))
+
+    # --- Gate 5: official field labels ------------------------------------
     if check_fields:
-        text = " ".join(pdf_text(path).split()).upper()
-        missing = [t for t in REQUIRED_TEXT
-                   if " ".join(t.split()).upper() not in text]
-        results.append(("required FD-258 fields present", not missing,
+        missing = [t for t in REQUIRED_TEXT if _norm(t) not in text]
+        results.append(("official FD-258 field labels present", not missing,
                         "all %d labels found" % len(REQUIRED_TEXT) if not missing
                         else f"missing: {', '.join(missing)}"))
 
@@ -717,7 +656,7 @@ def safe_name_part(value: str) -> str:
 
 
 def default_filename(lastname: str | None, firstname: str | None) -> str:
-    """FD-258_<LASTNAME>_<FIRSTNAME>.pdf, per hard requirement #3."""
+    """FD-258_<LASTNAME>_<FIRSTNAME>.pdf"""
     return "FD-258_%s_%s.pdf" % (safe_name_part(lastname or "BLANK"),
                                  safe_name_part(firstname or "CARD"))
 
@@ -736,18 +675,23 @@ def cmd_generate(args: argparse.Namespace) -> int:
     parent = os.path.dirname(os.path.abspath(out))
     os.makedirs(parent, exist_ok=True)
 
+    source = args.source or official_card_path()
     if args.raster:
-        build_raster_pdf(out, data, letter=args.letter, dpi=args.dpi)
-        mode = f"raster ({args.dpi} DPI embedded)"
+        build_raster_pdf(out, data, letter=args.letter, dpi=args.dpi,
+                         source=source)
+        mode = f"official card, re-rendered at {args.dpi} DPI"
     else:
-        build_vector_pdf(out, data, letter=args.letter)
-        mode = "vector"
+        build_official_pdf(out, data, letter=args.letter, source=source)
+        mode = "official card as published" + (
+            " (mounted on US Letter)" if args.letter else "")
 
     size = "612 x 792 pt (US Letter)" if args.letter else "576 x 576 pt (8\" x 8\")"
     print(f"Wrote {out}")
+    print(f"  source    : {source}")
     print(f"  mode      : {mode}")
-    print(f"  page size : {size}")
-    print(f"  fields    : {'pre-filled: ' + ', '.join(sorted(data)) if data else 'blank'}")
+    print(f"  page size : {size}, {OFFICIAL_PAGES} pages (front + back)")
+    filled = sorted(resolve_data(data))
+    print(f"  fields    : {'overlay pre-fill: ' + ', '.join(filled) if filled else 'blank (manual ink workflow)'}")
     print("  print at 100% / \"Actual size\" - do not fit-to-page.")
 
     if args.verify:
@@ -765,39 +709,54 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0 if ok else 1
 
 
+def cmd_fetch(args: argparse.Namespace) -> int:
+    """Refresh the bundled copy of the official card from fbi.gov."""
+    dest = download_official_card(args.dest)
+    print(f"Downloaded {OFFICIAL_URL}\n  -> {dest} ({os.path.getsize(dest)} bytes)")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="fd258_card.py",
-        description="Generate and QA-verify print-ready FBI FD-258 "
-                    "fingerprint cards (8\" x 8\", 300 DPI).",
+        description="Generate and QA-verify print-ready copies of the OFFICIAL "
+                    "FBI FD-258 fingerprint card (8\" x 8\", from fbi.gov).",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
                "  fd258_card.py generate --out FD-258_GROS_MARCELO.pdf\n"
                "  fd258_card.py generate --lastname Gros --firstname Marcelo\n"
                "  fd258_card.py generate --letter --out card_letter.pdf\n"
-               "  fd258_card.py verify --file FD-258_GROS_MARCELO.pdf\n")
+               "  fd258_card.py verify --file FD-258_GROS_MARCELO.pdf\n"
+               "  fd258_card.py fetch     # refresh official/ from fbi.gov\n")
     sub = p.add_subparsers(dest="command", required=True)
 
-    g = sub.add_parser("generate", help="write a blank or pre-filled card PDF")
+    g = sub.add_parser("generate",
+                       help="write the official card (blank, or pre-filled)")
     g.add_argument("--out", help="output path (default FD-258_<LAST>_<FIRST>.pdf)")
     g.add_argument("--outdir", help="directory to write the PDF into")
     g.add_argument("--letter", action="store_true",
-                   help="mount the 8x8 card at 100%% on US Letter with trim marks")
+                   help="mount each official page at 100%% on US Letter "
+                        "with trim marks")
     g.add_argument("--raster", action="store_true",
-                   help="embed a %d DPI rendering instead of vector art" % PRINT_DPI)
+                   help="re-render the official pages at %d DPI and embed them"
+                        % PRINT_DPI)
     g.add_argument("--dpi", type=int, default=PRINT_DPI,
                    help="raster resolution for --raster (default/minimum %d)" % PRINT_DPI)
+    g.add_argument("--source", help="official FD-258 PDF to use "
+                                    "(default: official/ cache, else fbi.gov)")
     g.add_argument("--verify", action="store_true",
                    help="run the QA gate on the file just written")
 
-    fill = g.add_argument_group("optional pre-fill (card is blank by default)")
+    fill = g.add_argument_group(
+        "optional pre-fill overlay (card is blank by default; signature boxes "
+        "are never filled)")
     fill.add_argument("--lastname")
     fill.add_argument("--firstname")
     fill.add_argument("--middlename")
     fill.add_argument("--aliases")
     fill.add_argument("--residence")
     fill.add_argument("--citizenship")
-    fill.add_argument("--dob", help="date of birth, MM DD YYYY")
+    fill.add_argument("--dob", help="date of birth, Month Day Year")
     fill.add_argument("--sex")
     fill.add_argument("--race")
     fill.add_argument("--height")
@@ -806,12 +765,14 @@ def build_parser() -> argparse.ArgumentParser:
     fill.add_argument("--hair")
     fill.add_argument("--pob", help="place of birth")
     fill.add_argument("--ssn", help="social security number")
-    fill.add_argument("--date-signed", dest="date_signed")
-    fill.add_argument("--contributor", help="contributor's name and address")
+    fill.add_argument("--employer", help="employer and address")
+    fill.add_argument("--contributor", help="alias for --employer")
     fill.add_argument("--reason", help="reason fingerprinted")
     fill.add_argument("--ori", help="originating agency identifier")
     fill.add_argument("--oca", help="your number / OCA")
     fill.add_argument("--date-fingerprinted", dest="date_fingerprinted")
+    fill.add_argument("--date-signed", dest="date_signed",
+                      help="alias for --date-fingerprinted (one DATE box)")
     g.set_defaults(func=cmd_generate)
 
     v = sub.add_parser("verify", help="run the QA gate against a PDF")
@@ -821,6 +782,11 @@ def build_parser() -> argparse.ArgumentParser:
     v.add_argument("--no-fields", action="store_true",
                    help="skip the FD-258 field-label text check")
     v.set_defaults(func=cmd_verify)
+
+    f = sub.add_parser("fetch", help="download the official FD-258 from fbi.gov")
+    f.add_argument("--dest", default=OFFICIAL_CACHE,
+                   help="where to store it (default %(default)s)")
+    f.set_defaults(func=cmd_fetch)
     return p
 
 
